@@ -245,7 +245,7 @@ fn compute_score(
         score += 15;
     }
     if has_cdn {
-        score += 10;
+        score = score.saturating_sub(20);
     }
 
     score += latency_points(tls_handshake_ms, 20);

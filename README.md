@@ -181,7 +181,7 @@ Score combines:
 - X25519 support
 - HTTP/2 support
 - SNI/domain match
-- CDN signal presence
+- CDN signal penalty (deducts points when CDN is detected)
 - TLS handshake latency points
 - TCP RTT latency points
 - HTTP availability penalty for non-`200` or failed HTTPS response

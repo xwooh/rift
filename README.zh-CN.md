@@ -179,7 +179,7 @@ cloudflare.com
 - X25519 支持
 - HTTP/2 支持
 - SNI/域名匹配
-- CDN 信号
+- CDN 信号惩罚（检测到 CDN 会扣分）
 - TLS 握手延迟得分
 - TCP RTT 延迟得分
 - HTTP 可用性惩罚（HTTP 非 `200` 或 HTTPS 请求失败会降分）
