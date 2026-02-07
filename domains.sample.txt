@@ -1,0 +1,10 @@
+google.com
+github.com
+cloudflare.com
+openai.com
+aws.amazon.com
+fastly.com
+akamai.com
+vercel.com
+reddit.com
+stackoverflow.com
