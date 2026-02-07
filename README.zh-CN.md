@@ -6,7 +6,8 @@
 
 - 通过附近 IPv4 网络动态扫描自动收集候选域名。
 - 检测 TLS 指标：证书可用性、TLS 1.3、X25519、SNI/域名匹配。
-- 检测 HTTP 指标：HTTP/2 支持与 CDN 头部信号。
+- 检测 HTTP 指标：HTTP/2 支持与状态码探测。
+- 检测 CDN 指标：证书签发者、HTTP 头、DNS CNAME 链与 IP/ASN 启发式信号。
 - 统计延迟指标：TCP RTT 与 TLS 握手 RTT。
 - 输出终端排名表，并支持导出 CSV。
 
@@ -104,6 +105,14 @@ cargo run --release -- \
   --top 30
 ```
 
+保留非 `200` 域名（默认不保留）：
+
+```bash
+cargo run --release -- \
+  --include-non-200 \
+  --top 50
+```
+
 ## 域名文件格式
 
 每行一个域名：
@@ -143,6 +152,8 @@ cloudflare.com
 - `--tcp-timeout-ms <N>`（默认：`1500`）：TCP 连接超时。
 - `--tls-timeout-ms <N>`（默认：`2500`）：TLS 握手超时。
 - `--http-timeout-ms <N>`（默认：`3000`）：HTTPS 请求超时。
+- `--dns-timeout-ms <N>`（默认：`1500`）：CNAME/ASN 检测相关 DNS 查询超时。
+- `--include-non-200`（默认：关闭）：是否在最终结果中保留 HTTP 非 `200` 或 HTTPS 请求失败的域名。
 
 ## 输出字段
 
@@ -154,6 +165,8 @@ cloudflare.com
 - `X25519`：仅 X25519 握手是否成功。
 - `H2`：是否支持 HTTP/2。
 - `SNI`：证书域名是否匹配 SNI/目标域名。
+- `HTTP`：HTTPS 响应状态码是否严格等于 `200`。
+- `HTTPCode`：HTTPS 响应状态码。
 - `CDN`：是否检测到 CDN 信号。
 - `Score`：最终评分（`0..=100`）。
 
@@ -169,6 +182,7 @@ cloudflare.com
 - CDN 信号
 - TLS 握手延迟得分
 - TCP RTT 延迟得分
+- HTTP 可用性惩罚（HTTP 非 `200` 或 HTTPS 请求失败会降分）
 
 同分时排序规则：
 
@@ -181,13 +195,15 @@ cloudflare.com
 
 - `Failed to detect local IPv4 address`：请手动指定 `--scan-anchor-ip <你的VPS IPv4>`。
 - `Dynamic discovery returned no domains`：提高 `--scan-samples-per-prefix`、`--scan-neighbor-prefixes` 或 `--max-open-ips`。
+- 结果里 `503` 过多：保持默认过滤（非 `200` 会被过滤），或使用 `--include-non-200` 以便排查这些站点。
 - 扫描耗时过长：降低 `--scan-samples-per-prefix`、`--max-probe-domains`、`--top`，并按需调整 `--concurrency`。
 - 结果为空：检查本机到外网 `443` 的连通性、DNS 与防火墙策略。
 
 ## 注意事项
 
 - 为了覆盖更多端点能力，TLS 探测阶段会关闭证书链校验。
-- CDN 判断基于启发式规则，可能误判或漏判。
+- CDN 判断基于启发式规则（证书、头部、DNS CNAME、IP/ASN），可能误判或漏判。
+- ASN 查询依赖 Team Cymru 的 DNS 服务，可能受本地 DNS 策略或网络限制影响。
 - 动态发现依赖当前时段与路由状态，多次运行结果可能不同。
 
 ## 开源协议

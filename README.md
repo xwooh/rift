@@ -8,7 +8,8 @@
 
 - Dynamic candidate discovery from nearby IPv4 network scanning.
 - TLS checks: certificate presence, TLS 1.3, X25519, and SNI/domain match.
-- HTTP checks: HTTP/2 support and CDN signal inference from headers.
+- HTTP checks: HTTP/2 support and status probing.
+- CDN checks: certificate issuer, HTTP headers, DNS CNAME chain, and IP/ASN heuristics.
 - Latency checks: TCP RTT and TLS handshake RTT.
 - Ranked output in terminal table plus optional CSV export.
 
@@ -106,6 +107,14 @@ cargo run --release -- \
   --top 30
 ```
 
+Keep non-`200` domains in output (disabled by default):
+
+```bash
+cargo run --release -- \
+  --include-non-200 \
+  --top 50
+```
+
 ## Domain File Format
 
 One domain per line:
@@ -145,6 +154,8 @@ Domain probing and ranking options:
 - `--tcp-timeout-ms <N>` (default: `1500`): TCP connect timeout.
 - `--tls-timeout-ms <N>` (default: `2500`): TLS handshake timeout.
 - `--http-timeout-ms <N>` (default: `3000`): HTTPS request timeout.
+- `--dns-timeout-ms <N>` (default: `1500`): DNS query timeout for CNAME/ASN detection.
+- `--include-non-200` (default: disabled): keep domains without HTTP `200` in final ranking.
 
 ## Output Columns
 
@@ -156,6 +167,8 @@ Domain probing and ranking options:
 - `X25519`: whether X25519-only handshake succeeded.
 - `H2`: whether HTTP/2 is supported.
 - `SNI`: whether cert names match domain/SNI.
+- `HTTP`: whether HTTPS response status is exactly `200`.
+- `HTTPCode`: HTTPS response status code.
 - `CDN`: whether CDN signals were detected.
 - `Score`: final score (`0..=100`).
 
@@ -171,6 +184,7 @@ Score combines:
 - CDN signal presence
 - TLS handshake latency points
 - TCP RTT latency points
+- HTTP availability penalty for non-`200` or failed HTTPS response
 
 Tie-break order:
 
@@ -183,13 +197,15 @@ Tie-break order:
 
 - `Failed to detect local IPv4 address`: set `--scan-anchor-ip <your_vps_ipv4>`.
 - `Dynamic discovery returned no domains`: increase `--scan-samples-per-prefix`, `--scan-neighbor-prefixes`, or `--max-open-ips`.
+- Too many `503` domains: keep default behavior (filters non-`200`) or pass `--include-non-200` if you need to inspect them.
 - Results are too slow: lower `--scan-samples-per-prefix`, `--max-probe-domains`, and `--top`; increase `--concurrency` carefully.
 - Results are empty in restricted networks: check outbound access to `443`, DNS, and local firewall policy.
 
 ## Notes
 
 - TLS certificate validation is intentionally disabled during probing to collect handshake capabilities from more endpoints.
-- CDN detection is heuristic and can produce false positives/negatives.
+- CDN detection is heuristic and combines cert issuer, headers, DNS CNAME, and IP/ASN signals.
+- ASN lookup uses Team Cymru DNS service and may be limited by local DNS policy or network restrictions.
 - Dynamic discovery is route-sensitive and time-sensitive; repeated runs can produce different domain pools.
 
 ## License
