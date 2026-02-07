@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::proto::rr::{Name, RData, RecordType};
 use reqwest::header::HeaderMap;
 use rustls::client::{ServerCertVerified, ServerCertVerifier};
 use rustls::{Certificate, ClientConfig, ServerName};
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
@@ -59,6 +61,14 @@ struct Cli {
     tls_timeout_ms: u64,
     #[arg(long, default_value_t = 3000)]
     http_timeout_ms: u64,
+    #[arg(long, default_value_t = 1500)]
+    dns_timeout_ms: u64,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Keep domains without HTTP 200 in final output"
+    )]
+    include_non_200: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -84,9 +94,17 @@ struct DomainReport {
     supports_x25519: bool,
     supports_h2: bool,
     sni_matches_domain: bool,
+    http_ok: bool,
+    http_status_code: Option<u16>,
     has_cdn: bool,
     cdn_signals: String,
     score: u32,
+}
+
+#[derive(Debug, Clone)]
+struct AsnLookupResult {
+    number: u32,
+    name: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +116,27 @@ struct TlsProbeResult {
     cert_dns_names: Vec<String>,
     cert_issuer: Option<String>,
 }
+
+#[derive(Debug, Default)]
+struct HttpProbeResult {
+    status_code: Option<u16>,
+    supports_h2: bool,
+    cdn_signals: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct DnsProbeResult {
+    cname_chain: Vec<String>,
+    ips: Vec<IpAddr>,
+}
+
+impl HttpProbeResult {
+    fn is_available(&self) -> bool {
+        self.status_code == Some(200)
+    }
+}
+
+type AsnCache = Arc<Mutex<HashMap<IpAddr, Option<AsnLookupResult>>>>;
 
 #[derive(Debug)]
 struct NoCertificateVerification;
@@ -155,20 +194,28 @@ async fn main() -> Result<()> {
     let tls_config_default = build_tls_config(false);
     let tls_config_x25519 = build_tls_config(true);
     let http_client = build_http_client(Duration::from_millis(cli.http_timeout_ms))?;
+    let dns_resolver = build_dns_resolver()?;
+    let asn_cache: AsnCache = Arc::new(Mutex::new(HashMap::new()));
     let tls_timeout = Duration::from_millis(cli.tls_timeout_ms);
+    let dns_timeout = Duration::from_millis(cli.dns_timeout_ms);
 
     let mut reports = stream::iter(nearby.into_iter())
         .map(|candidate| {
             let tls_config_default = tls_config_default.clone();
             let tls_config_x25519 = tls_config_x25519.clone();
             let http_client = http_client.clone();
+            let dns_resolver = dns_resolver.clone();
+            let asn_cache = asn_cache.clone();
             async move {
                 analyze_domain(
                     candidate,
                     tls_timeout,
+                    dns_timeout,
                     tls_config_default,
                     tls_config_x25519,
                     http_client,
+                    dns_resolver,
+                    asn_cache,
                 )
                 .await
             }
@@ -176,6 +223,22 @@ async fn main() -> Result<()> {
         .buffer_unordered(cli.concurrency)
         .collect::<Vec<_>>()
         .await;
+
+    if !cli.include_non_200 {
+        let before_filter = reports.len();
+        reports.retain(|report| report.http_ok);
+        let filtered = before_filter.saturating_sub(reports.len());
+        if filtered > 0 {
+            println!(
+                "Filtered {} domains without HTTP 200. Use --include-non-200 to keep them.",
+                filtered
+            );
+        }
+        if reports.is_empty() {
+            println!("No domains left after HTTP 200 filtering.");
+            return Ok(());
+        }
+    }
 
     reports.sort_by(|left, right| {
         right
@@ -229,6 +292,10 @@ fn build_http_client(timeout_duration: Duration) -> Result<reqwest::Client> {
         .user_agent("rift/0.1")
         .build()
         .context("failed to build HTTP client")
+}
+
+fn build_dns_resolver() -> Result<TokioAsyncResolver> {
+    TokioAsyncResolver::tokio_from_system_conf().context("failed to build DNS resolver")
 }
 
 async fn load_domains(cli: &Cli) -> Result<Vec<String>> {
@@ -556,9 +623,12 @@ async fn measure_tcp_rtt_ms(domain: &str, timeout_duration: Duration) -> Option<
 async fn analyze_domain(
     candidate: DomainCandidate,
     tls_timeout: Duration,
+    dns_timeout: Duration,
     tls_config_default: Arc<ClientConfig>,
     tls_config_x25519: Arc<ClientConfig>,
     http_client: reqwest::Client,
+    dns_resolver: TokioAsyncResolver,
+    asn_cache: AsnCache,
 ) -> DomainReport {
     let baseline = tls_probe(&candidate.domain, tls_timeout, tls_config_default).await;
     let supports_x25519 = if baseline.success {
@@ -577,10 +647,21 @@ async fn analyze_domain(
         false
     };
 
-    let (has_cdn, mut cdn_signals, h2_from_http) =
-        detect_cdn(&candidate.domain, &baseline, &http_client).await;
-    supports_h2 = supports_h2 || h2_from_http;
+    let http_probe = detect_cdn(
+        &candidate.domain,
+        &baseline,
+        &http_client,
+        &dns_resolver,
+        dns_timeout,
+        &asn_cache,
+    )
+    .await;
+    supports_h2 = supports_h2 || http_probe.supports_h2;
+    let http_ok = http_probe.is_available();
+    let http_status_code = http_probe.status_code;
+    let mut cdn_signals = http_probe.cdn_signals;
     cdn_signals.sort();
+    let has_cdn = !cdn_signals.is_empty();
 
     let score = compute_score(
         has_tls_cert,
@@ -591,6 +672,7 @@ async fn analyze_domain(
         candidate.tcp_rtt_ms,
         baseline.handshake_ms,
         has_cdn,
+        http_ok,
     );
 
     DomainReport {
@@ -603,6 +685,8 @@ async fn analyze_domain(
         supports_x25519,
         supports_h2,
         sni_matches_domain,
+        http_ok,
+        http_status_code,
         has_cdn,
         cdn_signals: cdn_signals.join("|"),
         score,
@@ -727,7 +811,10 @@ async fn detect_cdn(
     domain: &str,
     tls_probe_result: &TlsProbeResult,
     http_client: &reqwest::Client,
-) -> (bool, Vec<String>, bool) {
+    dns_resolver: &TokioAsyncResolver,
+    dns_timeout: Duration,
+    asn_cache: &AsnCache,
+) -> HttpProbeResult {
     let mut signals = BTreeSet::new();
     if let Some(issuer) = tls_probe_result.cert_issuer.as_deref() {
         if let Some(keyword) = find_cdn_keyword(issuer) {
@@ -735,15 +822,219 @@ async fn detect_cdn(
         }
     }
 
+    let dns_probe = probe_dns(domain, dns_resolver, dns_timeout).await;
+    for cname in &dns_probe.cname_chain {
+        if let Some(keyword) = find_cdn_keyword(cname) {
+            signals.insert(format!("dns-cname:{keyword}"));
+        }
+    }
+    for ip in dns_probe.ips.into_iter().take(MAX_ASN_LOOKUPS_PER_DOMAIN) {
+        if let Some(asn_info) = lookup_asn_info(ip, dns_resolver, dns_timeout, asn_cache).await {
+            signals.extend(cdn_signals_from_asn(&asn_info));
+        }
+    }
+
     let mut h2_from_http = false;
+    let mut status_code = None;
     let url = format!("https://{domain}/");
     if let Ok(response) = http_client.get(url).send().await {
+        status_code = Some(response.status().as_u16());
         h2_from_http = response.version() == reqwest::Version::HTTP_2;
         signals.extend(cdn_signals_from_headers(response.headers()));
     }
 
-    let has_cdn = !signals.is_empty();
-    (has_cdn, signals.into_iter().collect(), h2_from_http)
+    HttpProbeResult {
+        status_code,
+        supports_h2: h2_from_http,
+        cdn_signals: signals.into_iter().collect(),
+    }
+}
+
+async fn probe_dns(
+    domain: &str,
+    resolver: &TokioAsyncResolver,
+    dns_timeout: Duration,
+) -> DnsProbeResult {
+    let cname_chain = resolve_cname_chain(domain, resolver, dns_timeout).await;
+
+    let mut ips = Vec::new();
+    if let Ok(Ok(lookup)) = timeout(dns_timeout, resolver.lookup_ip(domain)).await {
+        let mut seen = HashSet::new();
+        for ip in lookup.iter() {
+            if seen.insert(ip) {
+                ips.push(ip);
+            }
+        }
+    }
+
+    DnsProbeResult { cname_chain, ips }
+}
+
+async fn resolve_cname_chain(
+    domain: &str,
+    resolver: &TokioAsyncResolver,
+    dns_timeout: Duration,
+) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = domain.trim_end_matches('.').to_ascii_lowercase();
+    let mut seen = HashSet::new();
+
+    for _ in 0..MAX_CNAME_CHAIN_DEPTH {
+        if !seen.insert(current.clone()) {
+            break;
+        }
+
+        let Ok(name) = Name::from_ascii(&current) else {
+            break;
+        };
+        let lookup = match timeout(dns_timeout, resolver.lookup(name, RecordType::CNAME)).await {
+            Ok(Ok(lookup)) => lookup,
+            _ => break,
+        };
+
+        let mut next = None;
+        for record in lookup.iter() {
+            if let RData::CNAME(cname) = record {
+                let candidate = cname.to_utf8().trim_end_matches('.').to_ascii_lowercase();
+                if !candidate.is_empty() {
+                    next = Some(candidate);
+                    break;
+                }
+            }
+        }
+
+        let Some(next_domain) = next else {
+            break;
+        };
+        chain.push(next_domain.clone());
+        current = next_domain;
+    }
+
+    chain
+}
+
+async fn lookup_asn_info(
+    ip: IpAddr,
+    resolver: &TokioAsyncResolver,
+    dns_timeout: Duration,
+    asn_cache: &AsnCache,
+) -> Option<AsnLookupResult> {
+    if let Ok(cache) = asn_cache.lock() {
+        if let Some(cached) = cache.get(&ip) {
+            return cached.clone();
+        }
+    }
+
+    let query_name = cymru_origin_query_name(ip);
+    let origin_record = lookup_txt_record(resolver, &query_name, dns_timeout).await;
+    let asn_number = origin_record
+        .as_deref()
+        .and_then(parse_origin_asn_from_record);
+
+    let result = if let Some(number) = asn_number {
+        let asn_name_query = format!("AS{number}.asn.cymru.com");
+        let asn_name = lookup_txt_record(resolver, &asn_name_query, dns_timeout)
+            .await
+            .and_then(|record| parse_asn_name_from_record(&record));
+        Some(AsnLookupResult {
+            number,
+            name: asn_name,
+        })
+    } else {
+        None
+    };
+
+    if let Ok(mut cache) = asn_cache.lock() {
+        cache.insert(ip, result.clone());
+    }
+
+    result
+}
+
+async fn lookup_txt_record(
+    resolver: &TokioAsyncResolver,
+    query_name: &str,
+    dns_timeout: Duration,
+) -> Option<String> {
+    let Ok(name) = Name::from_ascii(query_name) else {
+        return None;
+    };
+    let lookup = match timeout(dns_timeout, resolver.txt_lookup(name)).await {
+        Ok(Ok(lookup)) => lookup,
+        _ => return None,
+    };
+
+    for record in lookup.iter() {
+        let joined = record
+            .txt_data()
+            .iter()
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        let normalized = joined.trim().trim_matches('"').to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return Some(normalized);
+        }
+    }
+
+    None
+}
+
+fn cymru_origin_query_name(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            format!(
+                "{}.{}.{}.{}.origin.asn.cymru.com",
+                octets[3], octets[2], octets[1], octets[0]
+            )
+        }
+        IpAddr::V6(v6) => {
+            let hex = v6
+                .octets()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let nibbles = hex
+                .chars()
+                .rev()
+                .map(|ch| ch.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            format!("{nibbles}.origin6.asn.cymru.com")
+        }
+    }
+}
+
+fn parse_origin_asn_from_record(record: &str) -> Option<u32> {
+    let first_column = record.split('|').next()?.trim();
+    let asn_token = first_column.split_whitespace().next()?;
+    asn_token.parse::<u32>().ok()
+}
+
+fn parse_asn_name_from_record(record: &str) -> Option<String> {
+    let parts = record
+        .split('|')
+        .map(|part| part.trim())
+        .collect::<Vec<_>>();
+    let as_name = parts.last()?.to_ascii_lowercase();
+    if as_name.is_empty() || as_name.chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
+        return None;
+    }
+    Some(as_name)
+}
+
+fn cdn_signals_from_asn(asn_info: &AsnLookupResult) -> Vec<String> {
+    let mut signals = BTreeSet::new();
+    if CDN_ASN_NUMBERS.contains(&asn_info.number) {
+        signals.insert(format!("asn:as{}", asn_info.number));
+    }
+    if let Some(as_name) = asn_info.name.as_deref() {
+        if let Some(keyword) = find_cdn_keyword(as_name) {
+            signals.insert(format!("asn-name:{keyword}"));
+        }
+    }
+    signals.into_iter().collect()
 }
 
 fn cdn_signals_from_headers(headers: &HeaderMap) -> Vec<String> {
@@ -789,6 +1080,7 @@ fn compute_score(
     tcp_rtt_ms: u64,
     tls_handshake_ms: Option<u64>,
     has_cdn: bool,
+    http_ok: bool,
 ) -> u32 {
     let mut score = 0u32;
     if has_tls_cert {
@@ -812,6 +1104,9 @@ fn compute_score(
 
     score += latency_points(tls_handshake_ms, 20);
     score += latency_points(Some(tcp_rtt_ms), 10);
+    if !http_ok {
+        score = score.saturating_sub(30);
+    }
     score.min(100)
 }
 
@@ -842,6 +1137,8 @@ fn print_reports(reports: &[DomainReport]) {
         "X25519".to_string(),
         "H2".to_string(),
         "SNI".to_string(),
+        "HTTP".to_string(),
+        "HTTPCode".to_string(),
         "CDN".to_string(),
         "Score".to_string(),
     ];
@@ -859,6 +1156,11 @@ fn print_reports(reports: &[DomainReport]) {
             bool_text(report.supports_x25519),
             bool_text(report.supports_h2),
             bool_text(report.sni_matches_domain),
+            bool_text(report.http_ok),
+            report
+                .http_status_code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             bool_text(report.has_cdn),
             report.score.to_string(),
         ]);
@@ -960,3 +1262,17 @@ const CDN_KEYWORDS: &[&str] = &[
     "azure front door",
     "azurefd",
 ];
+
+const CDN_ASN_NUMBERS: &[u32] = &[
+    13335, // Cloudflare
+    20940, // Akamai
+    16625, // Akamai
+    54113, // Fastly
+    16509, // Amazon
+    14618, // Amazon
+    15133, // Edgecast
+    8075,  // Microsoft
+];
+
+const MAX_CNAME_CHAIN_DEPTH: usize = 8;
+const MAX_ASN_LOOKUPS_PER_DOMAIN: usize = 3;
