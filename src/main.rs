@@ -12,6 +12,7 @@ mod cli;
 mod discovery;
 mod models;
 mod output;
+mod progress;
 mod tls;
 
 use cdn::detect_cdn;
@@ -19,6 +20,7 @@ use clap::Parser;
 use discovery::{discover_nearby_domains, load_domains};
 use models::{AsnCache, DomainCandidate, DomainReport};
 use output::{print_reports, write_csv};
+use progress::run_with_progress_dots;
 use tls::{build_tls_config, cert_matches_domain, tls_probe};
 
 #[tokio::main]
@@ -40,12 +42,15 @@ async fn main() -> Result<()> {
     );
 
     let tcp_timeout = Duration::from_millis(cli.tcp_timeout_ms);
-    let nearby = discover_nearby_domains(
-        probe_pool,
-        tcp_timeout,
-        cli.nearby_rtt_ms,
-        cli.max_nearby_domains,
-        cli.concurrency,
+    let nearby = run_with_progress_dots(
+        "Probing candidate domains for nearby RTT",
+        discover_nearby_domains(
+            probe_pool,
+            tcp_timeout,
+            cli.nearby_rtt_ms,
+            cli.max_nearby_domains,
+            cli.concurrency,
+        ),
     )
     .await;
     if nearby.is_empty() {
@@ -65,30 +70,33 @@ async fn main() -> Result<()> {
     let tls_timeout = Duration::from_millis(cli.tls_timeout_ms);
     let dns_timeout = Duration::from_millis(cli.dns_timeout_ms);
 
-    let mut reports = stream::iter(nearby.into_iter())
-        .map(|candidate| {
-            let tls_config_default = tls_config_default.clone();
-            let tls_config_x25519 = tls_config_x25519.clone();
-            let http_client = http_client.clone();
-            let dns_resolver = dns_resolver.clone();
-            let asn_cache = asn_cache.clone();
-            async move {
-                analyze_domain(
-                    candidate,
-                    tls_timeout,
-                    dns_timeout,
-                    tls_config_default,
-                    tls_config_x25519,
-                    http_client,
-                    dns_resolver,
-                    asn_cache,
-                )
-                .await
-            }
-        })
-        .buffer_unordered(cli.concurrency)
-        .collect::<Vec<_>>()
-        .await;
+    let mut reports = run_with_progress_dots(
+        "Analyzing TLS/CDN capabilities",
+        stream::iter(nearby.into_iter())
+            .map(|candidate| {
+                let tls_config_default = tls_config_default.clone();
+                let tls_config_x25519 = tls_config_x25519.clone();
+                let http_client = http_client.clone();
+                let dns_resolver = dns_resolver.clone();
+                let asn_cache = asn_cache.clone();
+                async move {
+                    analyze_domain(
+                        candidate,
+                        tls_timeout,
+                        dns_timeout,
+                        tls_config_default,
+                        tls_config_x25519,
+                        http_client,
+                        dns_resolver,
+                        asn_cache,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(cli.concurrency)
+            .collect::<Vec<_>>(),
+    )
+    .await;
 
     if !cli.include_non_200 {
         let before_filter = reports.len();

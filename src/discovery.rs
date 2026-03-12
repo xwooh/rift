@@ -1,5 +1,6 @@
 use crate::cli::Cli;
 use crate::models::{DomainCandidate, IpCandidate};
+use crate::progress::run_with_progress_dots;
 use crate::tls::{build_tls_config, parse_certificate};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
@@ -101,12 +102,15 @@ async fn discover_domains_dynamically(cli: &Cli) -> Vec<String> {
         return Vec::new();
     }
 
-    let open_ips = discover_open_https_ips(
-        targets,
-        Duration::from_millis(cli.tcp_timeout_ms),
-        cli.ip_discovery_rtt_ms,
-        cli.max_open_ips,
-        cli.concurrency,
+    let open_ips = run_with_progress_dots(
+        "Scanning sampled IPs for open HTTPS",
+        discover_open_https_ips(
+            targets,
+            Duration::from_millis(cli.tcp_timeout_ms),
+            cli.ip_discovery_rtt_ms,
+            cli.max_open_ips,
+            cli.concurrency,
+        ),
     )
     .await;
     println!(
@@ -120,20 +124,23 @@ async fn discover_domains_dynamically(cli: &Cli) -> Vec<String> {
 
     let tls_timeout = Duration::from_millis(cli.tls_timeout_ms);
     let tls_config = build_tls_config(false);
-    let discovered = stream::iter(open_ips.into_iter())
-        .map(|candidate| {
-            let tls_config = tls_config.clone();
-            async move {
-                tls_probe_ip_domains(candidate.ip, tls_timeout, tls_config)
-                    .await
-                    .into_iter()
-                    .map(|domain| (domain, candidate.tcp_rtt_ms))
-                    .collect::<Vec<_>>()
-            }
-        })
-        .buffer_unordered(cli.concurrency.max(1))
-        .collect::<Vec<_>>()
-        .await;
+    let discovered = run_with_progress_dots(
+        "Resolving domains from discovered HTTPS IPs",
+        stream::iter(open_ips.into_iter())
+            .map(|candidate| {
+                let tls_config = tls_config.clone();
+                async move {
+                    tls_probe_ip_domains(candidate.ip, tls_timeout, tls_config)
+                        .await
+                        .into_iter()
+                        .map(|domain| (domain, candidate.tcp_rtt_ms))
+                        .collect::<Vec<_>>()
+                }
+            })
+            .buffer_unordered(cli.concurrency.max(1))
+            .collect::<Vec<_>>(),
+    )
+    .await;
 
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
