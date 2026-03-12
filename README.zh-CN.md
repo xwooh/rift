@@ -17,6 +17,31 @@
 cargo build --release
 ```
 
+使用 `musl` 打包静态 Linux 二进制：
+
+```bash
+make static-package
+```
+
+在一台全新的 Debian 或 Ubuntu 上，建议先打印引导命令：
+
+```bash
+make print-bootstrap-apt
+```
+
+如果需要由 `Makefile` 自动安装构建工具链：
+
+```bash
+make bootstrap-apt
+make static-package
+```
+
+静态打包会产出：
+
+- `dist/rift`
+- `rift-v<version>-linux-<arch>-<libc>.tar.gz`
+- `rift-v<version>-linux-<arch>-<libc>.tar.gz.sha256`
+
 ## 工作流程
 
 默认模式（不传 `--domains-file`）会执行：
@@ -113,6 +138,12 @@ cargo run --release -- \
   --top 50
 ```
 
+运行已经打包好的静态二进制：
+
+```bash
+./dist/rift --scan-anchor-ip 203.0.113.10 --top 20
+```
+
 ## 域名文件格式
 
 每行一个域名：
@@ -198,6 +229,7 @@ cloudflare.com
 - 结果里 `503` 过多：保持默认过滤（非 `200` 会被过滤），或使用 `--include-non-200` 以便排查这些站点。
 - 扫描耗时过长：降低 `--scan-samples-per-prefix`、`--max-probe-domains`、`--top`，并按需调整 `--concurrency`。
 - 结果为空：检查本机到外网 `443` 的连通性、DNS 与防火墙策略。
+- 长时间看起来没有输出：扫描和分析阶段每 5 秒会打印一个 `.` 作为进度心跳。
 
 ## 注意事项
 
@@ -205,6 +237,7 @@ cloudflare.com
 - CDN 判断基于启发式规则（证书、头部、DNS CNAME、IP/ASN），可能误判或漏判。
 - ASN 查询依赖 Team Cymru 的 DNS 服务，可能受本地 DNS 策略或网络限制影响。
 - 动态发现依赖当前时段与路由状态，多次运行结果可能不同。
+- `make print-bootstrap-apt` 只打印 Debian/Ubuntu 初始化命令，`make bootstrap-apt` 会实际执行安装。
 
 ## 开源协议
 

@@ -19,6 +19,31 @@
 cargo build --release
 ```
 
+Static Linux package with `musl`:
+
+```bash
+make static-package
+```
+
+On a clean Debian or Ubuntu host, print bootstrap steps first:
+
+```bash
+make print-bootstrap-apt
+```
+
+If you want `Makefile` to install the required toolchain automatically:
+
+```bash
+make bootstrap-apt
+make static-package
+```
+
+Static packaging produces:
+
+- `dist/rift`
+- `rift-v<version>-linux-<arch>-<libc>.tar.gz`
+- `rift-v<version>-linux-<arch>-<libc>.tar.gz.sha256`
+
 ## How It Works
 
 Default mode (no `--domains-file`) runs this pipeline:
@@ -115,6 +140,12 @@ cargo run --release -- \
   --top 50
 ```
 
+Run packaged static binary:
+
+```bash
+./dist/rift --scan-anchor-ip 203.0.113.10 --top 20
+```
+
 ## Domain File Format
 
 One domain per line:
@@ -200,6 +231,7 @@ Tie-break order:
 - Too many `503` domains: keep default behavior (filters non-`200`) or pass `--include-non-200` if you need to inspect them.
 - Results are too slow: lower `--scan-samples-per-prefix`, `--max-probe-domains`, and `--top`; increase `--concurrency` carefully.
 - Results are empty in restricted networks: check outbound access to `443`, DNS, and local firewall policy.
+- Long-running stages look idle: the CLI prints a progress dot every 5 seconds during scanning and analysis.
 
 ## Notes
 
@@ -207,6 +239,7 @@ Tie-break order:
 - CDN detection is heuristic and combines cert issuer, headers, DNS CNAME, and IP/ASN signals.
 - ASN lookup uses Team Cymru DNS service and may be limited by local DNS policy or network restrictions.
 - Dynamic discovery is route-sensitive and time-sensitive; repeated runs can produce different domain pools.
+- `make print-bootstrap-apt` only prints Debian/Ubuntu setup commands; `make bootstrap-apt` actually runs them.
 
 ## License
 
